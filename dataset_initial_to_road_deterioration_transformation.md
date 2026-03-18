@@ -1,1022 +1,950 @@
 # Road Event History Dataset Documentation
 
-This document explains the purpose, structure, transformation logic, and usage of the unified road event history dataset created from the raw road deterioration history data.
+This document describes the transformed road event-history dataset used for machine learning, forecasting, and pavement lifecycle analysis.
 
-It is written for engineers and data scientists who need to understand:
+The dataset converts wide historical road data into **one chronological event table**, where both condition measurements and treatment events are preserved in time order.
 
-- what the original source data looked like
-- what was changed during transformation
-- what information is preserved in the final dataset
-- what assumptions are embedded in the dataset
-- how the resulting dataset should be used for modeling and analysis
+**Output file:** `road_event_history_v2.parquet`
 
 ---
 
-# 1. Purpose of the Dataset
+## 1. Purpose
 
-The goal of the transformation is to convert a wide historical road dataset into a single chronological event-history dataset that is flexible enough for machine learning, analytics, and feature engineering.
+The dataset is designed as a **canonical event-history source** for downstream analysis. Typical uses include:
 
-The final dataset is designed to support use cases such as:
+- pavement condition prediction
+    
+- multi-step forecasting at future measurement dates
+    
+- lifecycle and deterioration analysis
+    
+- sequence modeling with measurements and treatments
+    
+- feature engineering from a single standardized source
+    
 
-- predicting pavement condition at future measurement events
-- predicting one or multiple measurements ahead
-- modeling deterioration within one pavement lifecycle
-- modeling deterioration across multiple lifecycles
-- using full history or partial history as model input
-- encoding maintenance and restoration events explicitly in the input history
-- deriving multiple downstream modeling datasets from one canonical source
-
-A key design goal was to avoid locking the project too early into one specific modeling setup.
-
-Instead of producing multiple specialized datasets, the transformation produces **one canonical parquet file** that preserves the most important historical information in a normalized and chronological structure.
+It is **not** intended to be the final ML design matrix. Model-specific filtering and target construction should be done separately.
 
 ---
 
-# 2. Original Dataset
+## 2. Source Data
 
-## 2.1 Source file
-
-The original source dataset is:
+### Source file
 
 `historiadata_ALL.parquet`
 
-It is a unified historical road dataset where each row represents one road segment and historical measurements and treatments are stored in wide form across many indexed columns.
+### Raw structure
 
-## 2.2 Row meaning in the raw dataset
+In the raw source:
 
-In the original data:
+- **1 row = 1 road segment**
+    
+- historical PTM measurements are stored in indexed columns such as `PTM_pvm_1`, `Iri_1`, `Ura_max_1`
+    
+- historical TP treatments are stored in indexed columns such as `Tp_pvm_1`, `Tp_pinta_1`, `Tp_työmen_1`
+    
+- the history is therefore in **wide format**, not event rows
+    
 
-- **1 row = 1 road segment**, typically a 100 m segment
+### Segment key
 
-Each row contains:
-
-- segment key fields
-- segment metadata
-- traffic attributes
-- geometric or road class attributes
-- treatment history in indexed columns
-- pavement measurement history in indexed columns
-
-## 2.3 Important raw column groups
-
-### Segment key columns
-
-These identify the segment:
+The segment is identified by these columns:
 
 - `ELY`
+    
 - `Tie`
+    
 - `Ajorata`
+    
 - `Kaista`
+    
 - `Aosa`
+    
 - `Aet`
+    
 - `Losa`
+    
 - `Let`
+    
 
-These columns together form the segment key used throughout the transformation.
+A derived segment identifier is created as:
 
-### Traffic and segment attributes
+`Segment_ID = "_".join(KEY_COLS as strings)`
 
-Common segment-level or road-level attributes include:
+### Static segment attributes
+
+These are copied onto event rows when present in the source:
 
 - `KVL`
+    
 - `KVL_raskas`
+    
 - `KVL_kaista`
+    
 - `Nopeus`
+    
 - `Toim_lk`
+    
 - `Pituus`
-
-These are treated as segment attributes and carried into the final event dataset.
-
-### PTM measurement history
-
-Historical pavement measurements are stored in indexed columns such as:
-
-- `PTM_pvm_i` = measurement date
-- `Iri_i` = IRI value for measurement slot `i`
-- `Ura_max_i` = URA value for measurement slot `i`
-
-Example:
-
-- `PTM_pvm_1`
-- `Iri_1`
-- `Ura_max_1`
-- `PTM_pvm_2`
-- `Iri_2`
-- `Ura_max_2`
-- ...
-
-In the original data, the history is encoded across columns rather than rows.
-
-### TP treatment history
-
-Historical treatment / maintenance events are stored in indexed columns such as:
-
-- `Tp_pvm_i` = treatment date
-- `Tp_pinta_i` = treatment surface / pavement-related descriptor
-- `Tp_työmen_i` or `Tp_tyomen_i` = treatment method descriptor
-
-Example:
-
-- `Tp_pvm_1`
-- `Tp_pinta_1`
-- `Tp_työmen_1`
-- `Tp_pvm_2`
-- `Tp_pinta_2`
-- `Tp_työmen_2`
-- ...
-
-## 2.4 Structural limitations of the original dataset
-
-The raw dataset is rich, but it is difficult to use directly for machine learning because it is in wide historical format.
-
-The main limitations are:
-
-- time history is spread across many columns instead of rows
-- the number of valid historical observations varies by segment
-- temporal ordering must be inferred from column indices and dates
-- measurements and treatments are stored in separate indexed histories
-- treatment events occur between measurements and are not naturally aligned to targets
-- feature engineering becomes awkward and brittle in wide format
-
-Because of these limitations, the raw dataset is not a convenient canonical source for downstream modeling.
+    
 
 ---
 
-# 3. Why the Dataset Was Restructured
+## 3. Why the Transformation Is Needed
 
-The transformation was designed to solve the main engineering and modeling problems in the raw data.
+The raw format is difficult to use directly because:
 
-## 3.1 Main design goals
+- time history is stored in columns instead of rows
+    
+- the number of historical observations varies by segment
+    
+- PTM measurements and TP treatments are separate indexed histories
+    
+- temporal ordering and interval logic are hard to compute in wide format
+    
+- ML pipelines need event rows, not sparse wide slots
+    
 
-The redesign aimed to:
-
-- convert history into explicit chronological rows
-- preserve both measurements and treatments
-- preserve treatment metadata instead of collapsing it away
-- keep multiple condition variables available
-- support both lifecycle-only and full-history modeling
-- support future feature engineering choices not yet decided
-- produce a single canonical parquet file instead of many specialized outputs
-
-## 3.2 Why not keep only a measurement panel
-
-A measurement-only panel is convenient for some models, but it loses flexibility if treatment events are reduced to coarse indicators.
-
-For example, if treatment rows are collapsed into only:
-
-- `has_TP_interval`
-- `tp_count_interval`
-
-then it becomes impossible to later recover:
-
-- exact treatment dates
-- treatment ordering inside an interval
-- time since last treatment
-- treatment-type-specific counts
-- treatment-method-specific effects
-- richer event-history sequences
-
-To avoid this information loss, the final design preserves both PTM and TP events explicitly in one chronological event table.
-
-## 3.3 Why use one canonical dataset
-
-Instead of producing many final datasets for different modeling scenarios, the pipeline now produces one canonical dataset that can be used to derive downstream datasets as needed.
-
-This reduces duplication and makes it easier to:
-
-- document one source of truth
-- reproduce modeling data consistently
-- change feature engineering later without re-reading the raw wide file every time
+The transformation solves this by producing one time-ordered dataset where each row is a single event.
 
 ---
 
-# 4. Concept of the New Dataset
+## 4. Final Dataset Concept
 
-The new dataset is a **unified chronological event-history table**.
+### Row definition
 
-## 4.1 Row meaning in the final dataset
+**1 row = 1 event for 1 segment on 1 date**
 
-In the final dataset:
+### Event types
 
-- **1 row = 1 dated event for 1 road segment**
+- `PTM` = measurement event
+    
+- `TP` = treatment event
+    
 
-An event can be one of two types:
+### Event ordering
 
-- `PTM` = pavement measurement event
-- `TP` = treatment / maintenance event
+Rows are sorted by:
 
-This means the final dataset combines both measurement history and treatment history into one time-ordered event stream.
+1. `Segment_ID`
+    
+2. `event_date`
+    
+3. `event_order`
+    
+4. `ptm_idx` / `tp_idx`
+    
 
-## 4.2 Event chronology
+### Same-day rule
 
-Within each segment, rows are ordered by:
+If a treatment and a measurement occur on the same date:
 
-1. `event_date`
-2. `event_order`
-3. event-specific slot index
+- `TP` is ordered first
+    
+- `PTM` is ordered second
+    
 
-Same-day ordering is handled explicitly:
+This is implemented with:
 
-- `TP` rows come before `PTM` rows on the same date
-
-This allows same-day treatment events to be considered part of the interval leading into the measurement on that date.
-
-## 4.3 What this structure enables
-
-The unified event format makes it possible to:
-
-- reconstruct complete event history for a segment
-- build measurement-only modeling datasets later
-- build sequence inputs from both measurements and treatments
-- define targets at measurement events
-- derive arbitrary lookback windows
-- use exact treatment timing and type in feature engineering
-- restrict models to one lifecycle or use full segment history
+- `event_order = 0` for `TP`
+    
+- `event_order = 1` for `PTM`
+    
 
 ---
 
-# 5. Transformation Overview
+## 5. Transformation Pipeline
 
-The transformation from the raw wide file to the final event file is conceptually done in two stages.
+The pipeline has two main stages plus final consolidation.
 
-## 5.1 Stage 1: Extract wide histories into normalized event tables
+### Stage 1: Streaming extraction from wide parquet
 
-The raw parquet file is read in streaming fashion to avoid excessive memory use.
+The raw parquet is read row-group by row-group to keep memory usage bounded.
 
-For each row-group and chunk:
+For each chunk:
 
-- PTM history columns are scanned
-- TP history columns are scanned
-- valid PTM rows are extracted into a temporary PTM event table
-- valid TP rows are extracted into a temporary TP event table
-- temporary data is written bucket-by-bucket to disk for memory-safe processing
+- filter segments to 100 m
+    
+- extract PTM events from indexed PTM columns
+    
+- extract TP events from indexed TP columns
+    
+- write extracted rows into temporary hash buckets by segment
+    
 
-At this stage, wide histories are converted into long event rows.
+This stage is where the strict ML-oriented filtering is applied.
 
-### PTM extraction
+### Stage 2: Build event history bucket by bucket
 
-Each valid measurement slot becomes one row with:
+For each bucket:
+
+- clean and deduplicate PTM rows
+    
+- clean and deduplicate TP rows
+    
+- compute PTM transition fields
+    
+- count TP events between measurement intervals
+    
+- infer lifecycle resets from PTM behavior
+    
+- attach surrounding PTM context to TP rows
+    
+- merge PTM and TP back into one event chronology
+    
+
+### Stage 3: Final consolidation
+
+All processed buckets are merged into a single parquet file:
+
+`road_event_history_v2.parquet`
+
+---
+
+## 6. Filtering and Cleaning Rules
+
+## Segment filter
+
+Only segments with:
+
+`Pituus == 100`
+
+are kept.
+
+This filter is applied early in Stage 1 for memory efficiency.
+
+## Date filters
+
+Only events from **2005-01-01 onward** are retained.
+
+Applied to:
+
+- PTM dates
+    
+- TP dates
+    
+
+Code constants:
+
+- `PTM_MIN_VALID_DATE = 2005-01-01`
+    
+- `TP_MIN_VALID_DATE = 2005-01-01`
+    
+- `MIN_VALID_PTM_YEAR = 2005`
+    
+- `MIN_VALID_TP_YEAR = 2005`
+    
+
+## PTM value cleaning
+
+Before ML filtering, PTM numeric values are cleaned using broad validity bounds:
+
+- `IRI` valid range: `0 <= IRI <= 20`
+    
+- `URA` valid range: `0 <= URA <= 80`
+    
+
+Values outside those ranges are set to missing.
+
+## PTM ML filter
+
+After cleaning, PTM rows are kept only if all of the following hold:
+
+- `IRI` is not missing
+    
+- `URA` is not missing
+    
+- `IRI <= 10`
+    
+- `URA <= 40`
+    
+
+This means the final PTM rows in the dataset have:
+
+- no missing `IRI`
+    
+- no missing `URA`
+    
+- bounded roughness and rutting values
+    
+- dates from 2005 onward
+    
+- 100 m segment length
+    
+
+## TP date cleaning
+
+TP dates are cleaned as follows:
+
+- year `1900` is treated as a placeholder and removed
+    
+- dates before `2005-01-01` are removed
+    
+- dates with year below `MIN_VALID_TP_YEAR` are removed
+    
+
+## PTM date cleaning
+
+PTM dates are cleaned as follows:
+
+- invalid dates are removed
+    
+- dates with year below `MIN_VALID_PTM_YEAR` are removed
+    
+
+---
+
+## 7. Deduplication Rules
+
+Deduplication is done separately for PTM and TP rows.
+
+### PTM duplicate key
+
+PTM rows are deduplicated by:
 
 - segment key
-- event date
-- event type = `PTM`
-- `ptm_idx`
-- `IRI`
-- `URA`
-- segment/static attributes
-
-### TP extraction
-
-Each valid treatment slot becomes one row with:
-
-- segment key
-- event date
-- event type = `TP`
-- `tp_idx`
-- `Tp_pinta`
-- `Tp_tyomen`
-- segment/static attributes
-
-## 5.2 Stage 2: Build unified event history and derive context
-
-For each segment bucket:
-
-- PTM rows are ordered chronologically
-- TP rows are ordered chronologically
-- PTM rows receive transition and lifecycle context
-- TP rows receive context from surrounding PTM rows
-- PTM and TP rows are concatenated into one event history
-- the bucket outputs are finally consolidated into one parquet file
-
----
-
-# 6. Data Cleaning and Normalization Rules
-
-The transformation includes a number of data cleanup rules inherited from the earlier pipeline design.
-
-These rules are important because they affect what is considered a valid event.
-
-## 6.1 Date cleaning
-
-### TP dates
-
-TP dates are converted to datetime and cleaned as follows:
-
-- placeholder year `1900` is treated as missing
-- dates earlier than `1950-01-01` are treated as invalid and removed
-- only TP years greater than or equal to 1950 are kept
-
-### PTM dates
-
-PTM dates are converted to datetime and cleaned as follows:
-
-- invalid or unparsable dates become missing
-- PTM years earlier than 1950 are removed
-
-## 6.2 Measurement value cleaning
-
-Measurement variables are converted to numeric and clamped to valid ranges.
-
-### IRI
-
-`IRI` is kept only if it falls in the range:
-
-- `0.0 <= IRI <= 20.0`
-
-Values outside this range are replaced with missing.
-
-### URA
-
-`URA` is kept only if it falls in the range:
-
-- `0.0 <= URA <= 80.0`
-
-Values outside this range are replaced with missing.
-
-## 6.3 Deduplication
-
-### PTM rows
-
-PTM rows are deduplicated using:
-
-- segment key
+    
 - `event_date`
+    
 - `event_type`
+    
 - `ptm_idx`
+    
 
-### TP rows
+### TP duplicate key
 
-TP rows are deduplicated using:
+TP rows are deduplicated by:
 
 - segment key
+    
 - `event_date`
+    
 - `event_type`
+    
 - `tp_idx`
-- `Tp_pinta` when available
-- `Tp_tyomen` when available
+    
+- `Tp_pinta` if present
+    
+- `Tp_tyomen` if present
+    
 
-The TP deduplication is intentionally less aggressive so that same-date treatment rows with different treatment metadata are not accidentally collapsed away.
-
----
-
-# 7. Derived Context Added to PTM Rows
-
-PTM rows are the rows where pavement state is directly observed, so most deterioration and lifecycle logic is computed from PTM rows.
-
-## 7.1 Transition variables
-
-For each PTM row, the dataset computes the previous measurement context within the same segment.
-
-### `prev_meas_date`
-Date of the previous PTM measurement for the same segment.
-
-### `next_meas_date`
-Date of the next PTM measurement for the same segment.
-
-### `prev_URA`
-URA at the previous measurement.
-
-### `prev_IRI`
-IRI at the previous measurement.
-
-### `delta_URA`
-Difference between current and previous URA.
-
-### `delta_IRI`
-Difference between current and previous IRI.
-
-### `Delta_t_days`
-Days between current and previous measurement.
-
-### `Delta_t_years`
-Years between current and previous measurement.
-
-For the first PTM observation of a segment, these previous-state fields are missing.
-
-## 7.2 Treatment count in measurement intervals
-
-For each PTM row, the dataset counts how many TP events occurred in:
-
-- `(previous measurement date, current measurement date]`
-
-This produces:
-
-### `tp_count_interval`
-Number of TP events between the previous and current PTM measurement.
-
-### `has_TP_interval`
-Boolean flag indicating whether any TP event occurred in the interval.
-
-Because same-day ordering is defined as TP before PTM, a TP on the same date as a PTM measurement is included in the interval ending at that PTM row.
+This allows multiple TP events on the same date when their indexed slot or metadata differs.
 
 ---
 
-# 8. Lifecycle and Reset Logic
+## 8. Derived Fields for PTM Rows
 
-The dataset also adds lifecycle-related interpretation to PTM rows.
+The following fields are computed from the ordered PTM sequence within each segment.
 
-This logic is based on the earlier modeling pipeline and is preserved as an analytical layer on top of the raw event history.
+### Measurement linkage
 
-## 8.1 Major reset detection
+- `prev_meas_date`: date of previous PTM measurement on the same segment
+    
+- `next_meas_date`: date of next PTM measurement on the same segment
+    
 
-A PTM row is marked as a major reset if one of the following is true:
+### Previous values
 
-### Known reset
+- `prev_IRI`: previous PTM roughness value
+    
+- `prev_URA`: previous PTM rutting value
+    
 
-- there was at least one TP event in the interval, and
-- `delta_URA <= -1.0`
+### Changes from previous PTM
+
+- `delta_IRI = IRI - prev_IRI`
+    
+- `delta_URA = URA - prev_URA`
+    
+
+### Time gap since previous PTM
+
+- `Delta_t_days`: days since previous PTM
+    
+- `Delta_t_years`: years since previous PTM, computed as `Delta_t_days / 365.25`
+    
+
+For the first PTM of a segment, these are missing:
+
+- `prev_meas_date`
+    
+- `prev_IRI`
+    
+- `prev_URA`
+    
+- `delta_IRI`
+    
+- `delta_URA`
+    
+- `Delta_t_days`
+    
+- `Delta_t_years`
+    
+
+### TP counts between measurements
+
+For each PTM row, treatment events are counted in the interval:
+
+`(prev_meas_date, current_meas_date]`
+
+This means:
+
+- the lower bound is open
+    
+- the current PTM date is included
+    
+- same-day TP is counted for the current PTM
+    
+
+Derived fields:
+
+- `tp_count_interval`: number of TP events in that interval
+    
+- `has_TP_interval`: whether `tp_count_interval > 0`
+    
+
+### Convenience copies for chronology
+
+For PTM rows, the code also sets:
+
+- `days_since_prev_meas = Delta_t_days`
+    
+- `days_until_next_meas = next_meas_date - event_date` in days
+    
+
+---
+
+## 9. Lifecycle Logic
+
+Lifecycle inference is heuristic and based on changes in `URA` between PTM measurements.
+
+### Reset thresholds
+
+Code constants:
+
+- `KNOWN_TP_RESET_DROP_MM = -1.0`
+    
+- `PHANTOM_RESET_DROP_MM = -3.0`
+    
+
+### Major reset
+
+A PTM row is flagged as a major reset if either of these is true:
+
+1. there was at least one TP in the interval and `delta_URA <= -1`
+    
+2. there was no TP in the interval and `delta_URA <= -3`
+    
+
+Derived field:
+
+- `is_major_reset`
+    
 
 ### Phantom reset
 
-- there was no TP event in the interval, and
-- `delta_URA <= -3.0`
+A phantom reset is a major reset inferred **without a recorded TP**:
 
-This is intended to detect strong pavement-condition resets, including cases where a treatment may be missing from the recorded TP history.
+- `has_TP_interval == False`
+    
+- `delta_URA <= -3`
+    
 
-## 8.2 Lifecycle-related columns
+Derived field:
 
-### `is_major_reset`
-Boolean flag indicating that the PTM row is treated as the start of a new major lifecycle after a reset.
-
-### `is_phantom_reset`
-Boolean flag indicating that the reset is inferred from a large URA drop without a recorded TP event.
-
-### `is_minor_treatment`
-Boolean flag indicating that a TP occurred in the interval but the event is not classified as a major reset.
-
-### `cycle_num`
-Cumulative lifecycle index within the segment.
-
-### `Lifecycle_ID`
-Unique lifecycle identifier formed as:
-
-`Segment_ID + "_C" + cycle_num`
-
-### `Pavement_Age_years`
-Age in years since the start of the lifecycle.
-
-### `Measurement_Idx`
-Index of the measurement within the lifecycle.
-
-### `Initial_URA`
-URA value at the first measurement in the lifecycle.
-
-### `Minor_TP_Count`
-Cumulative number of minor treatments within the lifecycle.
-
-## 8.3 Important interpretation note
-
-Lifecycle logic is **derived**, not raw.
-
-It is useful for analysis and model construction, but it should be understood as an interpretation based on rules rather than a directly observed ground-truth field from the raw source.
-
----
-
-# 9. Context Added to TP Rows
-
-TP rows preserve treatment events as first-class rows in the chronology.
-
-These rows do not directly observe pavement condition, so they do not receive PTM-only transition variables such as `delta_URA` or `delta_IRI`.
-
-However, they do receive surrounding measurement context when available.
-
-## 9.1 Surrounding measurement fields on TP rows
-
-### `prev_meas_date`
-Most recent PTM measurement date at or before the TP event.
-
-### `next_meas_date`
-Next PTM measurement date at or after the TP event.
-
-### `days_since_prev_meas`
-Days between the TP event and the previous measurement.
-
-### `days_until_next_meas`
-Days between the TP event and the next measurement.
-
-## 9.2 Lifecycle context on TP rows
-
-TP rows also receive lifecycle context from the most recent PTM row at or before the TP date, when such a PTM exists.
-
-This includes:
-
-- `Lifecycle_ID`
-- `cycle_num`
-- `Initial_URA`
-- `Pavement_Age_years`
-
-This allows treatment rows to be placed inside the broader lifecycle chronology even though the lifecycle itself is derived from PTM behavior.
-
----
-
-# 10. Final Dataset Format
-
-## 10.1 Final output file
-
-The final canonical dataset is stored as a single parquet file.
-
-Example output name:
-
-`road_event_history_v1.parquet`
-
-## 10.2 Row format
-
-Each row is one event for one segment.
-
-Possible event types:
-
-- `PTM`
-- `TP`
-
-## 10.3 Ordering
-
-To correctly interpret history, the dataset should be processed in segment-specific chronological order.
-
-The recommended ordering is:
-
-- `Segment_ID`
-- `event_date`
-- `event_order`
-- `ptm_idx` / `tp_idx` as tie-breakers when relevant
-
-## 10.4 Key identifiers
-
-### Raw segment key fields
-
-- `ELY`
-- `Tie`
-- `Ajorata`
-- `Kaista`
-- `Aosa`
-- `Aet`
-- `Losa`
-- `Let`
-
-### Derived segment identifier
-
-### `Segment_ID`
-String identifier created by concatenating the segment key columns.
-
-### `Lifecycle_ID`
-Derived lifecycle identifier for rows where lifecycle context is available.
-
-### `Event_Idx`
-Sequential event index within the segment after all events are sorted chronologically.
-
----
-
-# 11. Key Columns in the Final Dataset
-
-The exact set of columns may depend slightly on the available raw source columns, but the canonical output is designed around the following fields.
-
-## 11.1 Core event fields
-
-### `event_date`
-Date of the event.
-
-### `event_type`
-Type of event:
-
-- `PTM` for measurement
-- `TP` for treatment
-
-### `event_order`
-Tie-break order for same-day events.
-
-- `0` for TP
-- `1` for PTM
-
-### `ptm_idx`
-Original PTM slot index from the raw wide file. Present on PTM rows.
-
-### `tp_idx`
-Original TP slot index from the raw wide file. Present on TP rows.
-
-## 11.2 Measurement fields
-
-### `IRI`
-Measured IRI value. Usually present on PTM rows only.
-
-### `URA`
-Measured URA value. Usually present on PTM rows only.
-
-## 11.3 Treatment fields
-
-### `Tp_pinta`
-Treatment surface or related treatment descriptor from the raw TP history.
-
-### `Tp_tyomen`
-Treatment method descriptor from the raw TP history.
-
-## 11.4 PTM transition fields
-
-These are mainly meaningful on PTM rows:
-
-- `prev_IRI`
-- `prev_URA`
-- `delta_IRI`
-- `delta_URA`
-- `Delta_t_days`
-- `Delta_t_years`
-
-## 11.5 Measurement context fields
-
-These can be meaningful for both PTM and TP rows:
-
-- `prev_meas_date`
-- `next_meas_date`
-- `days_since_prev_meas`
-- `days_until_next_meas`
-
-## 11.6 Lifecycle fields
-
-- `Measurement_Idx`
-- `cycle_num`
-- `Lifecycle_ID`
-- `Pavement_Age_years`
-- `Initial_URA`
-- `Minor_TP_Count`
-- `is_major_reset`
 - `is_phantom_reset`
+    
+
+### Minor treatment
+
+A PTM row is flagged as minor treatment if:
+
+- there was at least one TP in the interval
+    
+- but the row is **not** a major reset
+    
+
+Derived field:
+
 - `is_minor_treatment`
+    
 
-## 11.7 Interval treatment summary fields
+### Lifecycle indexing
 
-These are computed relative to PTM measurement intervals:
+Within each segment:
 
-- `tp_count_interval`
-- `has_TP_interval`
+- `cycle_num` is the cumulative count of major resets
+    
+- `Lifecycle_ID = Segment_ID + "_C" + cycle_num`
+    
 
-## 11.8 Segment/static attributes
+Note that lifecycle numbering starts from the initial state of the segment and increases whenever a major reset is detected.
 
-Depending on source availability, the final dataset may include:
+### Lifecycle age and position
 
-- `KVL`
-- `KVL_raskas`
-- `KVL_kaista`
-- `Nopeus`
-- `Toim_lk`
-- `Pituus`
+Within each lifecycle:
 
-These are repeated across event rows for the segment.
+- `Measurement_Idx`: running PTM index within lifecycle
+    
+- `Pavement_Age_years`: years since first PTM in the lifecycle
+    
+- `Initial_URA`: first `URA` value in the lifecycle
+    
+- `Minor_TP_Count`: cumulative count of PTM rows flagged as `is_minor_treatment` within the lifecycle
+    
 
 ---
 
-# 12. How to Interpret Missing Values
+## 10. TP Context Fields
 
-Because the final dataset combines different event types into one table, many columns are intentionally sparse.
+TP rows do not have their own measured `IRI` or `URA`, so they are enriched with context from surrounding PTM rows.
 
-This is expected.
+For each TP row, the code finds:
 
-## 12.1 Missing values on TP rows
+- the nearest previous PTM on the same segment
+    
+- the nearest next PTM on the same segment
+    
 
-On `TP` rows, the following are usually missing because there is no direct pavement measurement at the treatment event:
+### Time context
+
+- `prev_meas_date`: previous PTM date before the TP
+    
+- `next_meas_date`: next PTM date after the TP
+    
+- `days_since_prev_meas`: days from previous PTM to TP
+    
+- `days_until_next_meas`: days from TP to next PTM
+    
+
+### Lifecycle context
+
+If a previous PTM exists, the TP row inherits from that PTM:
+
+- `Lifecycle_ID`
+    
+- `cycle_num`
+    
+- `Initial_URA`
+    
+
+`Pavement_Age_years` for TP is then computed as:
+
+- time since the start date of that inherited lifecycle
+    
+
+### Fields intentionally missing on TP rows
+
+TP rows do **not** have PTM transition values, so these remain missing:
 
 - `IRI`
+    
 - `URA`
+    
 - `prev_IRI`
+    
 - `prev_URA`
+    
 - `delta_IRI`
+    
 - `delta_URA`
+    
 - `Delta_t_days`
+    
 - `Delta_t_years`
-- some lifecycle transition flags
+    
 
-## 12.2 Missing values on first PTM rows
+Also, interval-based PTM flags are not meaningfully defined for TP rows, so fields such as the following are initialized as missing on TP rows:
 
-On the first PTM row for a segment, previous-measurement fields are usually missing:
+- `tp_count_interval`
+    
+- `has_TP_interval`
+    
+- `is_minor_treatment`
+    
+- `Minor_TP_Count`
+    
+- `is_major_reset`
+    
+- `is_phantom_reset`
+    
+- `Measurement_Idx`
+    
+
+If a TP occurs before the first valid PTM of a segment, lifecycle-related fields may remain missing.
+
+---
+
+## 11. Final Dataset Structure
+
+### File
+
+`road_event_history_v2.parquet`
+
+### Event granularity
+
+- one row per event
+    
+- event may be either PTM or TP
+    
+
+### Main identifiers
+
+- `Segment_ID`: unique segment identifier
+    
+- `Lifecycle_ID`: derived lifecycle identifier within segment
+    
+- `Event_Idx`: running event index within segment chronology
+    
+
+### Ordering columns
+
+- `event_date`
+    
+- `event_order`
+    
+- `ptm_idx`
+    
+- `tp_idx`
+    
+
+---
+
+## 12. Important Columns
+
+## Core chronology
+
+- `event_date`: event date
+    
+- `year`: calendar year extracted from `event_date`
+    
+- `event_type`: `PTM` or `TP`
+    
+- `event_order`: same-day precedence, `TP=0`, `PTM=1`
+    
+- `Event_Idx`: running event number within segment
+    
+
+## Original wide-slot indices
+
+- `ptm_idx`: original PTM slot number from the wide source
+    
+- `tp_idx`: original TP slot number from the wide source
+    
+
+These are useful for traceability back to the raw wide layout.
+
+## PTM measurement fields
+
+- `IRI`: measured roughness value
+    
+- `URA`: measured rutting value
+    
+
+## Treatment metadata
+
+- `Tp_pinta`: treatment surface/type descriptor from source
+    
+- `Tp_tyomen`: treatment method descriptor from source
+    
+
+The code supports both source spellings:
+
+- `Tp_työmen_i`
+    
+- `Tp_tyomen_i`
+    
+
+but stores the output in the normalized column:
+
+- `Tp_tyomen`
+    
+
+## Transition fields
+
+- `prev_IRI`
+    
+- `prev_URA`
+    
+- `delta_IRI`
+    
+- `delta_URA`
+    
+- `Delta_t_days`
+    
+- `Delta_t_years`
+    
+
+## Interval treatment fields
+
+- `tp_count_interval`
+    
+- `has_TP_interval`
+    
+
+## Lifecycle fields
+
+- `cycle_num`
+    
+- `Lifecycle_ID`
+    
+- `Measurement_Idx`
+    
+- `Pavement_Age_years`
+    
+- `Initial_URA`
+    
+- `Minor_TP_Count`
+    
+- `is_major_reset`
+    
+- `is_phantom_reset`
+    
+- `is_minor_treatment`
+    
+
+## Static segment attributes
+
+- `KVL`
+    
+- `KVL_raskas`
+    
+- `KVL_kaista`
+    
+- `Nopeus`
+    
+- `Toim_lk`
+    
+- `Pituus`
+    
+
+---
+
+## 13. Missing Values
+
+Missing values are expected in several places.
+
+### Expected missing on TP rows
+
+Normally missing on TP rows:
+
+- `IRI`
+    
+- `URA`
+    
+- `prev_IRI`
+    
+- `prev_URA`
+    
+- `delta_IRI`
+    
+- `delta_URA`
+    
+- `Delta_t_days`
+    
+- `Delta_t_years`
+    
+- `Measurement_Idx`
+    
+
+Some lifecycle fields may also be missing if no prior PTM exists.
+
+### Expected missing on first PTM row of a segment
+
+For the first PTM measurement of a segment:
 
 - `prev_meas_date`
-- `prev_URA`
+    
 - `prev_IRI`
-- `delta_URA`
+    
+- `prev_URA`
+    
 - `delta_IRI`
+    
+- `delta_URA`
+    
 - `Delta_t_days`
+    
 - `Delta_t_years`
+    
 
-This is normal because there is no earlier measurement for comparison.
-
-## 12.3 Missing lifecycle context on early TP rows
-
-If a TP event occurs before the first available PTM measurement for a segment, lifecycle-related fields on that TP row may be missing because lifecycle assignment is anchored to PTM history.
+are missing by definition.
 
 ---
 
-# 13. How the New Dataset Differs from the Earlier Panel Design
+## 14. Differences from Older Versions
 
-An earlier design produced a measurement-centric panel where each row represented one PTM measurement and treatment history was reduced to interval summary fields.
+Compared with a measurement-only panel, this dataset:
 
-The new event-history dataset differs in important ways.
+- preserves full event chronology
+    
+- keeps TP rows as explicit events
+    
+- retains treatment metadata
+    
+- computes measurement transitions directly
+    
+- adds lifecycle inference
+    
+- applies stricter ML-oriented filtering during extraction
+    
 
-## 13.1 What the earlier panel kept
-
-The earlier panel mainly kept:
-
-- PTM measurement rows
-- previous measurement context
-- interval treatment counts
-- lifecycle segmentation
-- selected static features
-
-## 13.2 What the earlier panel lost
-
-The earlier panel dropped or compressed:
-
-- explicit TP rows
-- treatment dates as first-class events
-- `Tp_pinta`
-- `Tp_tyomen`
-- exact treatment timing inside intervals
-- richer full-history sequencing options
-
-## 13.3 What the new event-history dataset preserves
-
-The new canonical dataset preserves:
-
-- PTM rows
-- TP rows
-- treatment metadata
-- measurement variables `URA` and `IRI`
-- treatment chronology
-- segment chronology across lifecycles
-- lifecycle annotations as derived context
-
-This makes it a better long-term canonical source.
+This makes it more suitable as a reusable base dataset for many tasks.
 
 ---
 
-# 14. Recommended Ways to Use the Dataset
+## 15. Recommended Usage
 
-The dataset is designed to be a canonical source, not necessarily the final model matrix.
-
-In most projects, you should derive task-specific training datasets from this file.
-
-## 14.1 General rule
-
-When building features or targets, first sort the data by:
+For analysis, always sort by:
 
 - `Segment_ID`
+    
 - `event_date`
+    
 - `event_order`
-- slot index where needed
+    
+- optionally `ptm_idx`, `tp_idx`
+    
 
-Then decide what rows are used as:
+Typical target setup:
 
-- input history
-- prediction targets
-- filtering boundaries such as lifecycle restrictions
+- predict the next PTM measurement
+    
+- use prior PTM and TP history as input
+    
+- optionally restrict modeling to PTM rows only
+    
 
-## 14.2 Predicting condition at the next measurement
+Common task-specific subsets:
 
-A common task is:
+- **PTM-only modeling:** keep only `event_type == "PTM"`
+    
+- **full event history modeling:** keep both PTM and TP
+    
+- **lifecycle analysis:** group by `Lifecycle_ID`
+    
+- **segment history analysis:** group by `Segment_ID`
+    
 
-- predict `URA` or `IRI` at the next PTM event
-
-Recommended approach:
-
-1. filter target rows to `event_type == "PTM"`
-2. build input history from earlier rows of the same segment
-3. choose whether history includes:
-   - only earlier PTM rows
-   - PTM + TP rows
-4. generate target by shifting PTM rows forward within the segment or within the lifecycle
-
-## 14.3 Predicting several measurements ahead
-
-For tasks like predicting 3 measurements ahead:
-
-1. restrict to PTM rows as candidate targets
-2. define the target as the PTM value at horizon `k` within the same segment or lifecycle
-3. build features from all earlier events available before the prediction time
-
-Because the dataset is event-based, you can choose whether to use:
-
-- only PTM history
-- only recent history
-- full event history including TP rows
-
-## 14.4 Lifecycle-only modeling
-
-If the goal is to model deterioration inside one lifecycle:
-
-- group by `Lifecycle_ID`
-- use only rows within the lifecycle
-- optionally exclude TP rows if the model is measurement-only
-- or keep TP rows if treatment events are part of the sequence input
-
-## 14.5 Whole-history modeling
-
-If the goal is to use the full road history:
-
-- group by `Segment_ID`
-- use all prior events before the target PTM row
-- let lifecycle boundaries be features rather than hard data cuts
-
-This is one of the main reasons the unified event-history structure was chosen.
+Treat this dataset as the canonical history source, then derive task-specific training tables separately.
 
 ---
 
-# 15. Example Interpretations
+## 16. Important Assumptions
 
-## 15.1 Example PTM row
+- reset detection is heuristic, not a ground-truth reconstruction
+    
+- static traffic variables may not reflect time-varying traffic over history
+    
+- source treatment records may be incomplete
+    
+- some wide slots may be sparse or inconsistent
+    
+- TP-only segments are dropped if no valid PTM remains after filtering
+    
 
-A PTM row might be interpreted as:
-
-- a measured pavement state for one road segment
-- with previous measured condition available
-- with time since previous measurement available
-- with number of treatment events since previous measurement available
-- with lifecycle identity and pavement age available
-
-This row is usually a natural candidate target row for supervised learning.
-
-## 15.2 Example TP row
-
-A TP row might be interpreted as:
-
-- a maintenance or restoration event
-- with treatment descriptors preserved
-- located between two measurements
-- placed into the segment chronology
-- optionally associated with a lifecycle
-
-This row is usually not a direct prediction target for pavement-condition forecasting, but it is valuable as context in the input history.
+That last point comes from the code: after Stage 2, TP rows are kept only for segments that still contain valid PTM rows.
 
 ---
 
-# 16. Engineering Notes and Practical Guidance
+## 17. Quick Workflow
 
-## 16.1 The dataset is canonical, not task-final
+1. load `road_event_history_v2.parquet`
+    
+2. sort by segment and chronology
+    
+3. inspect a few segments manually
+    
+4. decide whether to model PTM rows only or full event history
+    
+5. define targets and features separately from this canonical table
+    
 
-Do not assume this file is the final matrix for every model.
+Useful validation checks:
 
-Instead, treat it as a canonical event-history source from which you derive:
-
-- model-specific windows
-- lag features
-- event encodings
-- target definitions
-- lifecycle-filtered subsets
-
-## 16.2 Preserve ordering in all downstream steps
-
-Many features depend on chronology.
-
-If rows are not sorted correctly within each segment, the meaning of:
-
-- previous measurement fields
-- interval treatment counts
-- lifecycle ordering
-- sequence inputs
-
-can break.
-
-## 16.3 Be explicit about target definition
-
-When building a model, define clearly:
-
-- which rows are prediction targets
-- whether targets are only PTM rows
-- whether horizon is measured in:
-  - number of measurements ahead, or
-  - calendar time ahead
-
-The dataset supports both, but they are different tasks.
-
-## 16.4 Use event type consciously
-
-In downstream modeling, decide explicitly how to encode event type.
-
-Possible approaches include:
-
-- use only PTM rows
-- use PTM rows and summarize TP rows into interval features
-- use both PTM and TP rows as a sequence
-- convert TP rows into event tokens or categorical treatment features
-
-The dataset is designed to keep all of these options open.
-
-## 16.5 Treat lifecycle labels as derived features
-
-`Lifecycle_ID`, `cycle_num`, and reset flags are useful, but they come from heuristic rules.
-
-They should be treated as derived analytical context, not unquestioned truth.
+- TP appears before PTM on the same day
+    
+- `tp_count_interval` matches treatment history between PTMs
+    
+- reset flags look plausible for large `URA` drops
+    
+- lifecycle age resets at major reset points
+    
 
 ---
 
-# 17. Known Assumptions and Caveats
+## 18. Summary
 
-The engineer using this dataset should be aware of the following assumptions.
+`road_event_history_v2.parquet` is a unified chronological road history dataset where:
 
-## 17.1 Reset logic is heuristic
+- PTM measurements are explicit rows
+    
+- TP treatments are explicit rows
+    
+- chronology is preserved
+    
+- transition fields are computed from measurement history
+    
+- lifecycle structure is inferred from `URA` behavior
+    
+- filtering is applied early for ML-oriented use
+    
 
-Major reset detection is based on URA-drop rules and treatment occurrence rules.
+The current version specifically adds:
 
-This is useful but not perfect. Some real resets may be missed, and some inferred resets may not reflect actual major rehabilitation.
+- 100 m segment filtering
+    
+- 2005+ event filtering
+    
+- strict PTM validity requirements
+    
+- bounded-memory streaming extraction
+    
 
-## 17.2 Some static attributes may be time-varying in reality
-
-Fields such as traffic attributes may change over calendar time in the real world, but in the current transformation they are carried from the segment row into event rows as available in the raw unified file.
-
-That means they should be interpreted as source-provided attributes attached to the segment, not necessarily as a fully time-resolved historical record.
-
-## 17.3 Source data quality still matters
-
-The transformation cleans obvious invalid dates and out-of-range measurements, but it does not guarantee that all remaining source values are semantically correct.
-
-Unexpected patterns should still be investigated against the raw data when needed.
-
-## 17.4 Sparse fields are normal
-
-Because this is a mixed event table, it is normal for many columns to be meaningful only for one event type.
-
-This is not a defect; it is part of the design.
-
----
-
-# 18. Suggested Workflow for New Engineers
-
-A practical onboarding workflow for using this dataset is:
-
-1. Load the parquet file.
-2. Inspect the schema and distinct `event_type` values.
-3. Sort rows by `Segment_ID`, `event_date`, `event_order`.
-4. Pick a few example segments and inspect their full chronology manually.
-5. Verify how PTM and TP rows interleave.
-6. Decide what the modeling target is.
-7. Derive a task-specific training view from the canonical event history.
-
-A good first manual check is to inspect one segment and confirm that:
-
-- PTM dates are in the expected order
-- TP events appear in the right place between measurements
-- same-day TP rows appear before same-day PTM rows
-- lifecycle changes happen where large resets are expected
+It should be treated as a **canonical event-history source**, not as a ready-made final ML table.
 
 ---
 
-# 19. Summary
+## 19. Column Cheat Sheet
 
-The original dataset stored road-segment history in wide form, which made it awkward to use for machine learning and temporal analysis.
-
-The new dataset restructures that information into a single chronological event-history table where each row is either:
-
-- a PTM measurement event, or
-- a TP treatment event
-
-The transformation preserves:
-
-- segment keys
-- treatment metadata
-- condition measurements
-- event chronology
-- lifecycle-related derived context
-
-The resulting dataset is intended to be the **canonical source** for downstream modeling and feature engineering.
-
-It is especially useful because it supports both:
-
-- simple measurement-based supervised learning workflows, and
-- richer sequence or event-history-based modeling workflows
-
-The most important idea for users of this dataset is:
-
-> this file is not just a table of measurements; it is a time-ordered history of both condition observations and treatment actions for each road segment.
-
-That is what gives it flexibility for future model design.
-
----
-
-# 20. Minimal Column Cheat Sheet
-
-This section gives a compact reference for the most important columns.
-
-| Column                                                           | Meaning                                    |
-| ---------------------------------------------------------------- | ------------------------------------------ |
-| `Segment_ID`                                                     | Derived unique segment identifier          |
-| `event_date`                                                     | Date of event                              |
-| `event_type`                                                     | `PTM` or `TP`                              |
-| `event_order`                                                    | Same-day ordering, TP before PTM           |
-| `ptm_idx`                                                        | Original PTM slot index                    |
-| `tp_idx`                                                         | Original TP slot index                     |
-| `URA`                                                            | Measured rutting value on PTM rows         |
-| `IRI`                                                            | Measured roughness value on PTM rows       |
-| `Tp_pinta`                                                       | Treatment descriptor                       |
-| `Tp_tyomen`                                                      | Treatment method descriptor                |
-| `prev_URA`                                                       | Previous PTM URA value                     |
-| `prev_IRI`                                                       | Previous PTM IRI value                     |
-| `delta_URA`                                                      | Change in URA from previous PTM            |
-| `delta_IRI`                                                      | Change in IRI from previous PTM            |
-| `Delta_t_days`                                                   | Days since previous PTM                    |
-| `tp_count_interval`                                              | Number of TP events since previous PTM     |
-| `has_TP_interval`                                                | Whether any TP occurred since previous PTM |
-| `is_major_reset`                                                 | Heuristic flag for major reset             |
-| `is_phantom_reset`                                               | Heuristic reset without recorded TP        |
-| `is_minor_treatment`                                             | TP interval without major reset            |
-| `cycle_num`                                                      | Lifecycle index within segment             |
-| `Lifecycle_ID`                                                   | Derived lifecycle identifier               |
-| `Measurement_Idx`                                                | PTM index within lifecycle                 |
-| `Pavement_Age_years`                                             | Years since lifecycle start                |
-| `KVL`, `KVL_raskas`, `KVL_kaista`, `Nopeus`, `Toim_lk`, `Pituus` | Segment/static attributes                  |
-
----
+| Column                 | Meaning                                                                   |
+| ---------------------- | ------------------------------------------------------------------------- |
+| `Segment_ID`           | Derived unique identifier built from the segment key columns              |
+| `Lifecycle_ID`         | Derived lifecycle identifier within a segment                             |
+| `Event_Idx`            | Running event number within a segment after chronological sorting         |
+| `event_date`           | Date of the event                                                         |
+| `year`                 | Calendar year extracted from `event_date`                                 |
+| `event_type`           | Event type: `PTM` or `TP`                                                 |
+| `event_order`          | Same-day ordering: `TP=0`, `PTM=1`                                        |
+| `ptm_idx`              | Original PTM slot index from the wide source                              |
+| `tp_idx`               | Original TP slot index from the wide source                               |
+| `IRI`                  | Measured roughness value on PTM rows                                      |
+| `URA`                  | Measured rutting value on PTM rows                                        |
+| `Tp_pinta`             | Treatment surface/type descriptor                                         |
+| `Tp_tyomen`            | Treatment method descriptor                                               |
+| `prev_meas_date`       | Previous PTM date on the same segment                                     |
+| `next_meas_date`       | Next PTM date on the same segment or surrounding a TP                     |
+| `prev_IRI`             | Previous PTM `IRI` value                                                  |
+| `prev_URA`             | Previous PTM `URA` value                                                  |
+| `delta_IRI`            | Change in `IRI` since previous PTM                                        |
+| `delta_URA`            | Change in `URA` since previous PTM                                        |
+| `Delta_t_days`         | Days since previous PTM                                                   |
+| `Delta_t_years`        | Years since previous PTM                                                  |
+| `days_since_prev_meas` | Days from previous PTM to current event                                   |
+| `days_until_next_meas` | Days from current event to next PTM                                       |
+| `tp_count_interval`    | Number of TP events in `(prev_meas_date, current_meas_date]` for PTM rows |
+| `has_TP_interval`      | Whether at least one TP occurred in that PTM interval                     |
+| `is_major_reset`       | Heuristic lifecycle reset flag                                            |
+| `is_phantom_reset`     | Reset inferred without recorded TP                                        |
+| `is_minor_treatment`   | TP interval without major reset                                           |
+| `cycle_num`            | Lifecycle index within a segment                                          |
+| `Measurement_Idx`      | PTM sequence number within lifecycle                                      |
+| `Pavement_Age_years`   | Years since lifecycle start                                               |
+| `Initial_URA`          | First `URA` observed in the lifecycle                                     |
+| `Minor_TP_Count`       | Cumulative count of minor-treatment PTM rows within lifecycle             |
+| `KVL`                  | Segment traffic attribute                                                 |
+| `KVL_raskas`           | Heavy traffic attribute                                                   |
+| `KVL_kaista`           | Lane-level traffic attribute                                              |
+| `Nopeus`               | Speed-related segment attribute                                           |
+| `Toim_lk`              | Functional class attribute                                                |
+| `Pituus`               | Segment length                                                            |

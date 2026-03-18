@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-build_road_event_history.py
+build_road_event_history_ml_filtered.py
 
-Create ONE unified chronological event-history parquet file from the wide raw road dataset.
+Create ONE unified chronological event-history parquet file from the wide raw road dataset,
+with additional ML-oriented filtering applied during PTM extraction.
 
 Final output:
   OUT_DIR/OUT_FINAL_SINGLE
 
 Design:
   - Stream-read the wide parquet row-group by row-group
-  - Extract PTM measurement events and TP treatment events into temporary bucketed parquet
+  - Filter segments to 100 m only
+  - Extract filtered PTM measurement events and TP treatment events into temporary bucketed parquet
   - For each bucket:
       * normalize events into one unified event table
       * compute PTM-derived transition fields
@@ -17,12 +19,6 @@ Design:
       * infer resets / lifecycles from PTM rows
       * propagate lifecycle context into unified chronology
   - Consolidate all bucket outputs into ONE final parquet file
-
-This script intentionally produces only ONE canonical dataset.
-It removes:
-  - growth-only outputs
-  - multiple view outputs
-  - optional branching between final dataset variants
 
 Requirements:
   - pyarrow
@@ -35,7 +31,7 @@ from __future__ import annotations
 import re
 import shutil
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,20 +46,27 @@ import pyarrow.parquet as pq
 # ============================================================
 IN_PARQUET = "data/historiadata_ALL.parquet"
 OUT_DIR = "data"
-OUT_FINAL_SINGLE = "road_event_history_v1.parquet"
+OUT_FINAL_SINGLE = "road_event_history_v2.parquet"
 
 # Keys
 KEY_COLS = ["ELY", "Tie", "Ajorata", "Kaista", "Aosa", "Aet", "Losa", "Let"]
 
 # Data quality / cleanup
-TP_MIN_VALID_DATE = pd.Timestamp("1950-01-01")
+# TP_MIN_VALID_DATE = pd.Timestamp("1950-01-01")
+TP_MIN_VALID_DATE = pd.Timestamp("2005-01-01")
 TP_PLACEHOLDER_YEAR = 1900
-PTM_MIN_VALID_DATE = pd.Timestamp("1950-01-01")
+# PTM_MIN_VALID_DATE = pd.Timestamp("1950-01-01")
+PTM_MIN_VALID_DATE = pd.Timestamp("2005-01-01")
 
 IRI_MIN, IRI_MAX = 0.0, 20.0
 URA_MIN, URA_MAX = 0.0, 80.0
-MIN_VALID_TP_YEAR = 1950
-MIN_VALID_PTM_YEAR = 1950
+MIN_VALID_TP_YEAR = 2005
+MIN_VALID_PTM_YEAR = 2005
+
+# ML filtering thresholds
+ML_REQUIRED_SEGMENT_LENGTH = 100.0
+ML_MAX_IRI = 10.0
+ML_MAX_URA = 40.0
 
 # Reset logic thresholds (mm)
 KNOWN_TP_RESET_DROP_MM = -1.0
@@ -181,6 +184,31 @@ def build_segment_id(df: pd.DataFrame) -> pd.Series:
     return df[KEY_COLS].astype(str).agg("_".join, axis=1)
 
 
+def print_quality_counts(events: pd.DataFrame) -> None:
+    missing_segment_id = int(events["Segment_ID"].isna().sum()) if "Segment_ID" in events.columns else -1
+    invalid_event_type = int((~events["event_type"].isin(["PTM", "TP"])).sum()) if "event_type" in events.columns else -1
+    invalid_event_order = int((~events["event_order"].isin([0, 1])).sum()) if "event_order" in events.columns else -1
+
+    ptm_rows = events["event_type"].eq("PTM")
+    tp_rows = events["event_type"].eq("TP")
+
+    ptm_rows_missing_ptm_idx = int(events.loc[ptm_rows, "ptm_idx"].isna().sum()) if "ptm_idx" in events.columns else -1
+    tp_rows_missing_tp_idx = int(events.loc[tp_rows, "tp_idx"].isna().sum()) if "tp_idx" in events.columns else -1
+
+    ptm_rows_missing_ura = int(events.loc[ptm_rows, "URA"].isna().sum()) if "URA" in events.columns else -1
+    ptm_rows_missing_iri = int(events.loc[ptm_rows, "IRI"].isna().sum()) if "IRI" in events.columns else -1
+
+    print(
+        "missing Segment_ID", missing_segment_id,
+        "invalid event_type", invalid_event_type,
+        "invalid event_order", invalid_event_order,
+        "PTM rows missing ptm_idx", ptm_rows_missing_ptm_idx,
+        "TP rows missing tp_idx", tp_rows_missing_tp_idx,
+        "PTM rows missing URA", ptm_rows_missing_ura,
+        "PTM rows missing IRI", ptm_rows_missing_iri,
+    )
+
+
 # -----------------------------
 # Stage 1: stream wide parquet -> bucketed PTM and TP events
 # -----------------------------
@@ -274,6 +302,23 @@ def _process_wide_chunk_to_events(
     n_buckets: int,
     static_cols: List[str],
 ) -> None:
+    # -------------------------------------------------
+    # Memory-safe early segment-length filter
+    # -------------------------------------------------
+    if "Pituus" in df.columns:
+        pituus_num = to_num(df["Pituus"])
+        keep_seg = pd.Series(
+            np.isclose(pituus_num.to_numpy(), ML_REQUIRED_SEGMENT_LENGTH),
+            index=df.index,
+        )
+        if not keep_seg.any():
+            return
+        df = df.loc[keep_seg].copy()
+        del pituus_num, keep_seg
+
+    if df.empty:
+        return
+
     keys = df[KEY_COLS].copy()
 
     # -------------------------
@@ -300,6 +345,17 @@ def _process_wide_chunk_to_events(
 
         iri = clamp_series_to_nan(df[ic], IRI_MIN, IRI_MAX) if ic in df.columns else pd.Series(np.nan, index=df.index)
         ura = clamp_series_to_nan(df[uc], URA_MIN, URA_MAX) if uc in df.columns else pd.Series(np.nan, index=df.index)
+
+        # -------------------------------------------------
+        # Requested ML filter:
+        #   - missing IRI/URA out
+        #   - IRI > 10 out
+        #   - URA > 40 out
+        # -------------------------------------------------
+        m = m & iri.notna() & ura.notna() & (iri <= ML_MAX_IRI) & (ura <= ML_MAX_URA)
+
+        if not m.any():
+            continue
 
         tmp = keys.loc[m].copy()
         for sc in static_cols:
@@ -399,7 +455,6 @@ def _process_wide_chunk_to_events(
 # -----------------------------
 # Stage 2: build unified event history bucket by bucket
 # -----------------------------
-
 def build_event_history_for_bucket(ptm_df: pd.DataFrame, tp_df: pd.DataFrame) -> pd.DataFrame:
     """
     Build one unified chronological event table for a single bucket.
@@ -466,6 +521,14 @@ def build_event_history_for_bucket(ptm_df: pd.DataFrame, tp_df: pd.DataFrame) ->
         tp = _compute_tp_context(tp, ptm)
     else:
         tp = pd.DataFrame()
+
+    # Optional: keep only segments that still have PTM rows after filtering
+    # This avoids segments containing only TP rows with no valid measurements left.
+    if not ptm.empty and not tp.empty:
+        valid_segments = set(ptm["Segment_ID"].dropna().unique())
+        tp = tp[tp["Segment_ID"].isin(valid_segments)].copy()
+    elif ptm.empty:
+        return pd.DataFrame()
 
     # -------------------------
     # Recombine into one unified chronology
@@ -582,18 +645,13 @@ def _compute_ptm_context(ptm: pd.DataFrame, tp_df: pd.DataFrame) -> pd.DataFrame
 
     return ptm
 
+
 def _compute_tp_context(tp: pd.DataFrame, ptm: pd.DataFrame) -> pd.DataFrame:
     """
-    Add surrounding PTM context to TP rows:
-      - prev / next measurement date
-      - days since prev / until next measurement
-      - lifecycle / cycle number based on most recent PTM at or before TP date
-
-    TP rows do NOT get PTM-only transition fields like delta_URA.
+    Add surrounding PTM context to TP rows.
     """
     tp = tp.copy()
 
-    # initialize fields so schema stays stable
     init_cols = {
         "Lifecycle_ID": pd.Series(pd.NA, index=tp.index, dtype="object"),
         "Measurement_Idx": pd.Series(pd.NA, index=tp.index, dtype="Int64"),
@@ -626,7 +684,6 @@ def _compute_tp_context(tp: pd.DataFrame, ptm: pd.DataFrame) -> pd.DataFrame:
     ptm = ptm.sort_values(["Segment_ID", "event_date", "ptm_idx"], kind="mergesort").reset_index(drop=True)
     tp = tp.sort_values(["Segment_ID", "event_date", "tp_idx"], kind="mergesort").reset_index(drop=True)
 
-    # Build per-segment PTM lookup
     ptm_lookup: Dict[str, pd.DataFrame] = {}
     for seg, g in ptm.groupby("Segment_ID", sort=False):
         ptm_lookup[seg] = g.reset_index(drop=True)
@@ -644,9 +701,7 @@ def _compute_tp_context(tp: pd.DataFrame, ptm: pd.DataFrame) -> pd.DataFrame:
         meas_dates = ref["event_date"].to_numpy(dtype="datetime64[ns]")
         ev_dates = g["event_date"].to_numpy(dtype="datetime64[ns]")
 
-        # previous measured state at or before event
         prev_idx = np.searchsorted(meas_dates, ev_dates, side="right") - 1
-        # next measurement at or after event
         next_idx = np.searchsorted(meas_dates, ev_dates, side="left")
 
         prev_meas = np.full(len(g), np.datetime64("NaT"), dtype="datetime64[ns]")
@@ -671,7 +726,6 @@ def _compute_tp_context(tp: pd.DataFrame, ptm: pd.DataFrame) -> pd.DataFrame:
             pd.to_datetime(g["next_meas_date"]) - pd.to_datetime(g["event_date"])
         ).dt.days
 
-        # lifecycle / cycle context from most recent PTM at or before TP date
         lifecycle_vals = []
         cycle_vals = []
         initial_ura_vals = []
@@ -731,6 +785,7 @@ def _compute_lifecycles_from_ptm(ptm: pd.DataFrame) -> pd.DataFrame:
 
     return ptm
 
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -750,6 +805,9 @@ def main() -> None:
     safe_mkdir(bucket_out_dir)
 
     print(f"Stage 1: streaming extract PTM/TP events from {IN_PARQUET}")
+    print(f"  ML segment filter: Pituus == {ML_REQUIRED_SEGMENT_LENGTH}")
+    print(f"  ML PTM filters: IRI notna and <= {ML_MAX_IRI}, URA notna and <= {ML_MAX_URA}")
+
     info = stage1_extract_events_streaming(
         in_parquet=IN_PARQUET,
         tmp_tp_dir=tmp_tp_dir,
@@ -800,6 +858,11 @@ def main() -> None:
 
     print(f"Saved final unified event-history parquet: {out_file}")
     print(f"  approx rows={total_rows:,}  approx segment-count-over-buckets={total_segments:,}")
+
+    print("Stage 4: quick final quality check")
+    final_df = pd.read_parquet(out_file)
+    print_quality_counts(final_df)
+
     print("Done.")
 
 
