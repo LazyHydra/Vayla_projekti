@@ -1,154 +1,98 @@
 # Vayla Road Deterioration Prediction
 
-This repository contains code and notebooks for a road deterioration prediction project based on historical road condition, maintenance, and segment data.
+This repository contains a classical machine-learning workflow for predicting road deterioration from historical road condition, maintenance, and segment data.
 
-The main indicators of interest are:
+Main prediction targets:
 
-- `URA` for rutting
-- `IRI` for roughness
+- `URA`: rutting
+- `IRI`: roughness
 
-The repository is organized around two main tasks:
+The current unified workflow is documented in detail in `methodology_cleanup_documentation.md`.
 
-- transforming raw historical road data into a structured event-history dataset
-- building a modeling dataset and testing baseline prediction models
+## Current Workflow
+
+The recommended classical modeling path is:
+
+1. Build the canonical event-history dataset.
+2. Build the supervised PTM-level modeling dataset.
+3. Run the controlled model-family comparison.
+4. Tune the selected final model family.
+5. Train and report the final selected model.
 
 ## Main Data Files
 
-### `data/road_event_history_v2.parquet`
+| File | Status | Purpose |
+| --- | --- | --- |
+| `data/road_event_history_v2.parquet` | Current canonical source | Chronological event-history table with PTM measurements, TP treatments, segment identifiers, lifecycle identifiers, treatment interval fields, and static road attributes. |
+| `data/road_model_dataset_v2.parquet` | Current modeling dataset | Supervised PTM-level dataset used by the unified comparison, tuning, and final training notebooks. |
+| `data/road_model_dataset_v1.parquet` | Older version | Earlier supervised modeling dataset used before the final methodology cleanup. |
 
-Canonical chronological event-history dataset.
+## Core Scripts
 
-Contains:
+| File | Status | Purpose |
+| --- | --- | --- |
+| `filter_and_create_ml_data_v3.py` | Current event-history builder | Builds `data/road_event_history_v2.parquet` from the raw wide-format source data. |
+| `build_model_dataset_v2.py` | Current modeling-dataset builder | Builds `data/road_model_dataset_v2.parquet` from the canonical event-history dataset. |
+| `build_model_dataset.py` | Older version | Earlier modeling-dataset builder for `road_model_dataset_v1.parquet`. |
+| `filter_and_create_ml_data_v2.py` | Deprecated/test version | Older event-history construction script kept for reference. |
 
-- PTM measurement events
-- TP treatment events
-- segment identifiers
-- lifecycle identifiers
-- previous-measurement fields
-- treatment interval fields
-- static segment attributes
+## Unified Modeling Notebooks
 
-This file is the main source dataset for downstream work.
-
-### `data/road_model_dataset_v1.parquet`
-
-Derived PTM-only modeling dataset created from the canonical event history.
-
-Contains:
-
-- one row per PTM measurement
-- current features
-- lag features
-- lifecycle features
-- static features
-- next-measurement targets:
-  - `target_next_URA`
-  - `target_next_IRI`
-
-## Scripts
-
-### [filter_and_create_ml_data_v3.py](/c:/Users/mkjun/Documents/School/misc_maisteri_kurssit/case_studies_operations_research/Vayla_projekti/filter_and_create_ml_data_v3.py)
-
-Builds the canonical event-history dataset from the raw wide-format parquet.
-
-Main responsibilities:
-
-- read the raw historical dataset row-group by row-group
-- filter segments and invalid rows
-- extract PTM and TP histories from indexed wide columns
-- build one chronological event table
-- compute transition, interval, and lifecycle fields
-- save the final canonical parquet
-
-Output:
-
-- `data/road_event_history_v2.parquet`
-
-### [build_model_dataset.py](/c:/Users/mkjun/Documents/School/misc_maisteri_kurssit/case_studies_operations_research/Vayla_projekti/build_model_dataset.py)
-
-Builds the modeling dataset from the canonical event-history parquet.
-
-Main responsibilities:
-
-- read PTM rows from the canonical dataset
-- preserve segment and lifecycle structure
-- create next-measurement targets within the same lifecycle
-- keep selected current, lag, lifecycle, and static variables
-- save the final modeling parquet
-
-Output:
-
-- `data/road_model_dataset_v1.parquet`
-
-## Notebooks
-
-### [baseline_simple_models.ipynb](/c:/Users/mkjun/Documents/School/misc_maisteri_kurssit/case_studies_operations_research/Vayla_projekti/baseline_simple_models.ipynb)
-
-Notebook for simple baseline experiments.
-
-Includes:
-
-- persistence baseline
-- linear regression
-- ridge regression
-- feature ablation experiments
-- coefficient inspection
-
-### [random_forest_baseline.ipynb](/c:/Users/mkjun/Documents/School/misc_maisteri_kurssit/case_studies_operations_research/Vayla_projekti/random_forest_baseline.ipynb)
-
-Notebook for random forest baseline experiments.
-
-Includes:
-
-- persistence baseline comparison
-- random forest models with several feature sets
-- feature importance inspection
+| File | Workflow stage | Purpose |
+| --- | --- | --- |
+| `model_comparison_final.ipynb` | Controlled model comparison | Compares persistence, linear/ridge, random forest, HistGradientBoosting, and GradientBoosting under one shared dataset, split, feature pipeline, and evaluation protocol. |
+| `model_comparison_final_plots.ipynb` | Reporting/visualization | Additional plotting notebook for final comparison results. |
+| `model_final_hyperparameter_tuning.ipynb` | Final model tuning | Tunes the final URA-focused model candidates, including HGB, sampled RF, delta-target HGB, and focused second-stage HGB delta search. |
+| `model_final_training.ipynb` | Final model training/reporting | Loads the best tuning candidate, trains on train + validation, evaluates once on test, and saves final model/report artifacts. |
 
 ## Documentation
 
-### [dataset_initial_to_road_deterioration_transformation.md](/c:/Users/mkjun/Documents/School/misc_maisteri_kurssit/case_studies_operations_research/Vayla_projekti/dataset_initial_to_road_deterioration_transformation.md)
+| File | Purpose |
+| --- | --- |
+| `methodology_cleanup_documentation.md` | Main reference for the unified workflow, including split design, feature engineering, model comparison, tuning, final training, and saved artifacts. |
+| `methodology_cleanup_plan.md` | Planning document that defined the unified methodology before implementation. |
+| `dataset_initial_to_road_deterioration_transformation.md` | Detailed documentation of the event-history data transformation. |
+| `baseline_model_results_summary.md` | Summary of earlier baseline model experiments. Historical reference only. |
 
-Detailed documentation of the canonical event-history dataset.
+## Historical / Pre-Unification Notebooks
 
-Describes:
+These notebooks were useful during exploration, but the final classical methodology is now represented by the unified notebooks above.
 
-- source data structure
-- transformation logic
-- filtering rules
-- lifecycle logic
-- important columns
-- typical dtypes
-- expected missing values
+| File | Status |
+| --- | --- |
+| `simple_models_baseline.ipynb` | Early baseline experiment. Historical. |
+| `simple_models_baseline_v2.ipynb` | Later simple-model baseline experiment. Superseded by `model_comparison_final.ipynb`. |
+| `random_forest_baseline.ipynb` | Early random forest baseline. Historical. |
+| `random_forest_baseline_v2.ipynb` | Later random forest baseline. Superseded by `model_comparison_final.ipynb`. |
+| `hist_gradient_boosting_baseline_v2.ipynb` | HGB baseline exploration. Superseded by the unified comparison and tuning notebooks. |
+| `road_event_dataset_information_v1.ipynb` | Event-dataset inspection notebook. Reference only. |
+| `road_model_dataset_information.ipynb` | Modeling-dataset inspection notebook. Reference only. |
 
-### [baseline_model_results_summary.md](/c:/Users/mkjun/Documents/School/misc_maisteri_kurssit/case_studies_operations_research/Vayla_projekti/baseline_model_results_summary.md)
+## Results Directories
 
-Summary file for baseline model results and notes.
+| Directory | Produced by | Contents |
+| --- | --- | --- |
+| `results/final_model_comparison/` | `model_comparison_final.ipynb` | Validation/test comparison tables, predictions, direct-vs-delta checks, and comparison figures. |
+| `results/final_model_tuning/` | `model_final_hyperparameter_tuning.ipynb` | URA-focused tuning tables, tuned test checks, tuning config, and tuning predictions. |
+| `results/final_model_training/` | `model_final_training.ipynb` | Final selected model artifact, metadata, test results, residual outputs, comparison table, and final figures. |
 
-## Other Files
+## Recommended Run Order
 
-### `road_event_dataset_information_v1.ipynb`
+For the current classical workflow:
 
-Notebook for inspecting or exploring the road event dataset.
+1. Run `filter_and_create_ml_data_v3.py`.
+2. Run `build_model_dataset_v2.py`.
+3. Run `model_comparison_final.ipynb`.
+4. Run `model_final_hyperparameter_tuning.ipynb`.
+5. Run `model_final_training.ipynb`.
 
-### `additional_data_transformation.ipynb`
-
-Notebook related to earlier or additional transformation work.
-
-### `filter_and_create_ml_data_v2.py`
-
-Older version of the event-history data creation script.
-
-## Recommended File Order
-
-If rebuilding the pipeline from scratch, the main order is:
-
-1. run [filter_and_create_ml_data_v3.py](/c:/Users/mkjun/Documents/School/misc_maisteri_kurssit/case_studies_operations_research/Vayla_projekti/filter_and_create_ml_data_v3.py)
-2. run [build_model_dataset.py](/c:/Users/mkjun/Documents/School/misc_maisteri_kurssit/case_studies_operations_research/Vayla_projekti/build_model_dataset.py)
-3. open [baseline_simple_models.ipynb](/c:/Users/mkjun/Documents/School/misc_maisteri_kurssit/case_studies_operations_research/Vayla_projekti/baseline_simple_models.ipynb)
-4. open [random_forest_baseline.ipynb](/c:/Users/mkjun/Documents/School/misc_maisteri_kurssit/case_studies_operations_research/Vayla_projekti/random_forest_baseline.ipynb)
+If only final model selection/reporting is needed and the data plus tuning outputs already exist, start from `model_final_training.ipynb`.
 
 ## Notes
 
-- The canonical dataset is the source of truth for downstream datasets.
-- The modeling dataset is a derived dataset for prediction experiments.
-- `Toim_lk` is categorical and should remain categorical in downstream modeling.
+- `data/road_event_history_v2.parquet` is the source of truth for downstream datasets.
+- `data/road_model_dataset_v2.parquet` is the current supervised table for the unified classical workflow.
+- The final comparison uses an ELY-stratified `Segment_ID` group split.
+- `ELY` is used for splitting and reporting, not as a model input.
+- `target_horizon_years` is included as a model input in every final feature mixture.
+- The current final tabular feature mixture is `current_static_lag_lifecycle_material`.
